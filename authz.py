@@ -1,64 +1,94 @@
-import base64, json
-
+import base64
 from flask import Flask, jsonify, request
+import json
+import re
 
-app = Flask(__name__)
-application = app
+
+application = app = Flask(__name__)
+app.debug = True
 
 
-def _has_said_hello():
-    with open('/var/run/authz-said-hello.txt', 'r') as hello_file:
-        has_said_hello = hello_file.read()
+# Keeps track of containers
+# Key is ID, value should be the username of owner or something
+# TODO: Replace with better data structure, ID might be abbreviated
+containers = {}
 
-    return has_said_hello == 'True'
 
-def _set_said_hello(said_hello):
-    with open('/var/run/authz-said-hello.txt', 'w') as hello_file:
-        hello_file.write(str(said_hello))
+def auth(data):
+    uri = data['RequestUri']
+    method = data['RequestMethod']
+    if data['RequestUri'] == '/_ping':
+        return True
+    if not uri.startswith('/v1.27/'):
+        app.logger.warning("Got request with unsupport API version: %s", uri)
+        return "Unsupported API version"
 
-@app.route("/")
-def index():
-    return "Docker Authz Plugin"
+    if method == 'GET' and (uri == '/v1.27/images/json' or uri.startswith('/v1.27/containers/json') or
+                            uri == '/v1.27/info' or uri.startswith('/v1.27/events?')):
+        # General information, allowed
+        return True
+    elif method == 'POST' and uri.startswith('/v1.27/images/create?'):
+        # Pulling a new image, allowed
+        return True
+    elif method == 'POST' and uri == '/v1.27/containers/create':
+        # TODO: Validate options
+        body = json.loads(base64.b64decode(data['RequestBody']))
+
+        if body['Image'] == 'hello-world':
+            return True
+        else:
+            return "You may only run hello-world"
+    elif re.match(r'/v1\.27/containers/[a-f0-9]+', uri):
+        # Operation on a container
+        if containers.get(uri[18:18+64]):
+            return True
+        else:
+            return "You don't have access to this container"
+
+    app.logger.debug("Unhandled request: %s %s", method, uri)
+    return False
+
 
 @app.route("/Plugin.Activate", methods=['POST'])
 def activate():
     return jsonify({'Implements': ['authz']})
 
+
 @app.route("/AuthZPlugin.AuthZReq", methods=['POST'])
 def authz_request():
-    print("AuthZ Request")
-    print(request.data)
-
     plugin_request = json.loads(request.data)
-    has_said_hello = _has_said_hello()
+    app.logger.info("request: %r", plugin_request)
+    response = auth(plugin_request)
 
-    if has_said_hello:
+    if response is False:
+        response = {"Allow": False,
+                    "Msg":   "Internal error",
+                    "Err":   "Internal error"}
+    elif response is True:
         response = {"Allow": True,
-                    "Msg":   "The request authorization succeeded."}
-    elif 'RequestBody' in plugin_request:
-            encoded_docker_request = plugin_request['RequestBody']
-            docker_request = json.loads(base64.b64decode(encoded_docker_request))
-
-            if docker_request['Image'] == 'hello-world':
-                _set_said_hello(True)
-                response = {"Allow": True,
-                            "Msg":   "The request authorization succeeded. Thanks for saying hello!"}
-            else:
-                response = {"Allow": False,
-                            "Msg":   "The request authorization failed. You must say hello first",
-                            "Err":   "You must say hello first."}
+                    "Msg":   "success"}
     else:
         response = {"Allow": False,
-                    "Msg":   "The request authorization failed. You must say hello first",
-                    "Err":   "You must say hello first."}
+                    "Msg":   response,
+                    "Err":   response}
 
     return jsonify(**response)
+
 
 @app.route("/AuthZPlugin.AuthZRes", methods=['POST'])
 def authz_response():
-    print("AuthZ Response")
-    response = {"Allow": True}
-    return jsonify(**response)
+    plugin_response = json.loads(request.data)
+    app.logger.info("response: %r", plugin_response)
+    uri = plugin_response['RequestUri']
+
+    if uri == '/v1.27/containers/create':
+        body = json.loads(base64.b64decode(plugin_response['ResponseBody']))
+        if 'Id' in body:
+            app.logger.info("Container created: %s", body['Id'])
+            containers[body['Id']] = True
+
+    return jsonify(Allow=True)
+
 
 if __name__ == "__main__":
     app.run()
